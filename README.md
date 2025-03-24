@@ -9,8 +9,12 @@ Dependencies：
 See requirements.txt
 
 Running the code：
-Python and SUMO: Python GTMA SUMO.py
-Just python: Python GTMA.py
+
+Python and SUMO: 
+Python GTMA SUMO.py
+
+Just python: 
+Python GTMA.py
 
 Plot:
 Python Gap.py
