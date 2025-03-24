@@ -1,297 +1,357 @@
 import pandas as pd
 import numpy as np
-import os
 import math
-import networkx as nx
-import pickle
+import os
 import time
+import networkx as nx
+from collections import defaultdict
 from datetime import datetime
-
-#########################################
-# 1. 数据读写
-#########################################
-def read_data(path):
-    data = pd.read_excel(path)
-    if 'Source' not in data.columns or 'Target' not in data.columns:
-        data['Source'] = data['init_node']
-        data['Target'] = data['term_node']
-    return data
-
-def read_node_data(path):
-    data = pd.read_csv(path)
-    return data
-
-output_dir = 'traffic_flow_images'
-if not os.path.exists(output_dir):
-    os.makedirs(output_dir)
-
-#########################################
-# 2. GAP计算函数
-#########################################
-def calculate_gap(current_flows, previous_flows):
-    total_difference = np.abs(current_flows - previous_flows).sum()
-    total_previous = np.abs(previous_flows).sum()
-    if total_previous == 0:
-        return 0
-    return total_difference / total_previous
+import heapq
+import copy
 
 
-#########################################
-# 3. 保留的数据初始化
-#########################################
-def add_three_col(network, od, total_time):
-    network["flow"] = [np.zeros(total_time) for _ in range(len(network))]
-    network["auxiliary_flow"] = [np.zeros(total_time) for _ in range(len(network))]
-    network["flow_time"] = [np.zeros(total_time) for _ in range(len(network))]
-    od.loc[:, "min_cost"] = np.zeros(len(od))
-
-def construct_index_table(network):
-    init_node_list = sorted(list(set(network["init_node"])))
-    index_table = {}
-    for node in init_node_list:
-        matching_indices = network.index[network["init_node"] == node].tolist()
-        if matching_indices:
-            index_table[node] = matching_indices[0]
-        else:
-            print(f"Warning: init_node {node} not found in network.")
-    return index_table
-
-#########################################
-# 4. 时间变学习率 γ(t) 与 拥堵敏感因子 ψ(t)
-#########################################
-def gamma_t(iteration, lambda_=1.0, xi=1.0, c=1.0):
-    val = lambda_ * iteration + xi
-    if val <= 1:
-        val = 2
-    return (1.0 / c) * math.log(val)
-
-def psi_t(flow, capacity, psi0=1.0, eta=0.5):
-    if capacity <= 0:
-        return psi0
-    ratio = flow / capacity
-    return psi0 * (1.0 + eta * ratio)
-
-#########################################
-# [新增] 外部成本函数：对单条边的 E_i
-#########################################
-def external_cost_for_edge(idx, network, current_time, user_flow=1.0):
+########################################################################
+# 0. Unified management of time-varying parameters
+########################################################################
+class TimeVaryingParams:
     """
-    给定边索引 idx, 返回当前时段对“一个单位流量”的外部成本 E_i。
-    """
-    flow_with_i = network.at[idx, "flow"][current_time]
-    flow_wo_i   = max(flow_with_i - user_flow, 0)
-    capacity    = network.at[idx, "capacity"]
-    fft         = network.at[idx, "free_flow_time"]
+    Manages time-varying parameters: gamma_t, psi_t, learning rate, etc.,
+    to reduce repeated computations.
 
-    # 如果容量<=0 或无效, 则外部成本记为0
-    if capacity is None or capacity <= 1e-9 or pd.isna(flow_with_i):
+    - get_gamma(iteration) : gamma_t = (1/c) * ln(lambda_ * iteration + xi)
+    - get_psi(flow, capacity): psi_t = psi0 * [1 + eta * (flow / capacity)]
+    - get_learning_rate(iteration, t): returns the learning rate for logit choice,
+      which can vary by iteration/time period.
+    """
+
+    def __init__(self,
+                 psi0=1.0, eta=0.5,
+                 lambda_=1.0, xi=1.0, c_=1.0,
+                 base_lr=1.0):
+        self.psi0 = psi0
+        self.eta = eta
+        self.lambda_ = lambda_
+        self.xi = xi
+        self.c_ = c_
+        self.base_lr = base_lr
+
+    def get_gamma(self, iteration):
+        """
+        gamma_t = (1/c_) * ln(lambda_ * iteration + xi)
+        iteration >= 1 to avoid ln(0).
+        """
+        val = self.lambda_ * iteration + self.xi
+        if val <= 1:
+            val = 2.0
+        return (1.0 / self.c_) * math.log(val)
+
+    def get_psi(self, flow, capacity):
+        """
+        psi_t = psi0 * [1 + eta*(flow/capacity)]
+        """
+        if capacity <= 1e-9:
+            return 0.0
+        ratio = flow / capacity
+        return self.psi0 * (1.0 + self.eta * ratio)
+
+    def get_learning_rate(self, iteration, t):
+        """
+        Example of a learning rate that can decay with iterations/time:
+          lr = base_lr / (1 + 0.1*iteration)
+        """
+        lr = self.base_lr / (1 + 0.1 * iteration)
+        return lr
+
+
+########################################################################
+# 1. Read data and build adjacency list
+########################################################################
+def read_data_to_adjlist(df_network):
+    """
+    Convert the network DataFrame into a dict-of-dict adjacency list:
+       adj_list[o][d] = {
+         'capacity': ...,
+         'free_flow_time': ...,
+         'length': ...,
+         'flow': np.zeros(T),   # flow per time period
+         'flow_time': np.zeros(T) # travel time per time period (from LTM)
+       }
+    """
+    adj_list = defaultdict(dict)
+    for idx, row in df_network.iterrows():
+        o = int(row['init_node'])
+        d = int(row['term_node'])
+        adj_list[o][d] = {
+            'capacity': float(row['capacity']),
+            'free_flow_time': float(row['free_flow_time']),
+            'length': float(row.get('length', 1.0)),
+            'flow': np.zeros(1),       # placeholder initialization
+            'flow_time': np.zeros(1)   # placeholder initialization
+        }
+    return dict(adj_list)
+
+
+########################################################################
+# 2. BPR external cost calculation
+########################################################################
+_external_cost_cache = {}
+
+
+def external_cost_for_edge(o, d, t, flow_val, capacity, fft,
+                           user_flow=1.0, alpha=0.15, beta=4.0):
+    """
+    Calculate the external cost of a single edge (o->d) at time period t.
+    External cost e_i = BPR(flow_val) - BPR(flow_val - user_flow),
+    approximated by the BPR function, with caching for faster retrieval.
+    """
+    global _external_cost_cache
+    cache_key = (o, d, t, float(flow_val))
+    if cache_key in _external_cost_cache:
+        return _external_cost_cache[cache_key]
+
+    if capacity <= 1e-9:
+        _external_cost_cache[cache_key] = 0.0
         return 0.0
 
-    alpha = 0.15
-    beta  = 4
+    def bpr_t(f):
+        return fft * (1.0 + alpha * (f / capacity) ** beta)
 
-    def bpr_t(flow):
-        return fft * (1.0 + alpha * (flow / capacity) ** beta)
-
-    t_with  = bpr_t(flow_with_i)
-    t_without = bpr_t(flow_wo_i)
-
-    e_i = max(t_with - t_without, 0)
+    t_with = bpr_t(flow_val)
+    t_wo = bpr_t(max(flow_val - user_flow, 0))
+    e_i = max(t_with - t_wo, 0)
+    _external_cost_cache[cache_key] = e_i
     return e_i
 
-#########################################
-# 5. calculate_edge_cost: 引入外部事件与 γ(t), ψ(t) + E_i
-#########################################
-def calculate_edge_cost(source, target, network, current_time, iteration,
-                        psi0=1.0, eta=0.5, lambda_=1.0, xi=1.0, c=1.0,
-                        event=False,
-                        user_flow=1.0):
-    edge_info = network[(network['init_node'] == source) & (network['term_node'] == target)]
-    if edge_info.empty:
-        return float('inf')
 
-    idx = edge_info.index[0]
-    # 使用上一轮 LTM 更新的时变出行时间 flow_time[t]
-    ltm_time = network.at[idx, "flow_time"][current_time]
-    if ltm_time <= 0:
-        # 如果是第一轮，可用 free_flow_time 作为后备
-        ltm_time = network.at[idx, "free_flow_time"]
+########################################################################
+# 3. Multi-agent path strategy class
+########################################################################
+class AgentPolicy:
+    """
+    Each OD corresponds to one policy (multiple feasible paths + probabilities).
+    """
 
-    # 若要考虑拥堵惩罚，需要用到 flow[t]
-    flow_val = network.at[idx, "flow"][current_time]
-    cap_val  = network.at[idx, "capacity"]
+    def __init__(self, paths):
+        self.paths = paths
+        if len(paths) > 0:
+            self.probs = np.ones(len(paths)) / len(paths)
+        else:
+            self.probs = np.array([])
 
-    gamma_val = gamma_t(iteration, lambda_, xi, c)
-    psi_val   = psi_t(flow_val, cap_val, psi0=psi0, eta=eta)
+    def choose_path(self):
+        """
+        Randomly pick one path according to the current strategy probabilities.
+        """
+        if len(self.probs) == 0:
+            return None
+        r = np.random.rand()
+        cum = 0
+        for i, p in enumerate(self.probs):
+            cum += p
+            if r <= cum:
+                return self.paths[i]
+        return self.paths[-1]
 
-    # （A）原有的动态修正系数
-    dyn_factor = 1.0 + gamma_val / (1.0 + psi_val)
-    cost_base  = ltm_time * dyn_factor
+    def update_policy(self, costs, learning_rate=1.0):
+        """
+        Logit choice update formula:
+          p'_i = p_i * exp(-lr * cost_i) / sum_j [ p_j * exp(-lr * cost_j) ]
+        """
+        if len(self.probs) == 0:
+            return
+        exps = np.zeros_like(self.probs)
+        for i, cst in enumerate(costs):
+            exps[i] = self.probs[i] * math.exp(-learning_rate * cst)
+        denom = exps.sum()
+        if denom < 1e-15:
+            self.probs = np.ones_like(exps) / len(exps)
+        else:
+            self.probs = exps / denom
 
-    # （B）外部成本
-    e_i = external_cost_for_edge(idx, network, current_time, user_flow)
 
-    # （C）合并：这里是加法叠加
-    cost_with_e = cost_base + e_i
+class MultiAgentRouteChoice:
+    """
+    (o, d) -> AgentPolicy
+    Manages multiple OD pairs, each OD has several paths + probabilities.
+    """
 
-    # 外部事件放大
-    if event:
-        cost_with_e *= 1.2
+    def __init__(self, adj_list, od_df, K_paths=3):
+        self.agent_policies = {}
+        self.od_demands = {}
+        for idx, row in od_df.iterrows():
+            o = int(row['init_node'])
+            d = int(row['term_node'])
+            dm = float(row['demand'])
+            if dm <= 1e-9:
+                continue
+            key = (o, d)
 
-    return cost_with_e
+            def tmp_fun(oo, dd):
+                return adj_list[oo][dd]['free_flow_time']
 
-#########################################
-# 6. 随机Log-Linear选路 (调用 cost)
-#########################################
-def log_linear_path_choice(candidate_paths, iteration, net, current_time,
-                           psi0=1.0, eta=0.5, lambda_=1.0, xi=1.0, c=1.0,
-                           event=False, kappa=1.0, user_flow=1.0):
-    costs = []
-    for path_nodes in candidate_paths:
-        cpath = 0.0
-        for i in range(len(path_nodes) - 1):
-            cpath += calculate_edge_cost(path_nodes[i], path_nodes[i + 1],
-                                         net, current_time, iteration,
-                                         psi0, eta, lambda_, xi, c,
-                                         event=event,
-                                         user_flow=user_flow)
-        costs.append(cpath)
+            kpaths = k_shortest_paths(adj_list, o, d, K=K_paths, cost_fun=tmp_fun)
+            self.agent_policies[key] = AgentPolicy(kpaths)
+            self.od_demands[key] = dm
 
-    # utility = -cost
-    utilities = [-val for val in costs]
-    gamma_val = gamma_t(iteration, lambda_, xi, c)
+    def choose_paths_for_all_agents(self, iteration, current_time):
+        """
+        For all ODs, pick one path according to the current policy, returning (demand, path).
+        """
+        results = []
+        for key, policy in self.agent_policies.items():
+            dm = self.od_demands[key]
+            path_ = policy.choose_path()
+            if path_ is not None:
+                results.append((dm, path_))
+        return results
 
-    tmp_scores = []
-    for u in utilities:
-        exponent_val = math.exp((gamma_val / kappa) * u)
-        tmp_scores.append(exponent_val)
-    denom = sum(tmp_scores)
+    def update_all_policies(self, path_costs, learning_rate=1.0):
+        """
+        path_costs: { (o,d): [cost1, cost2, ...] }
+        """
+        for key, costs_list in path_costs.items():
+            if key in self.agent_policies:
+                self.agent_policies[key].update_policy(costs_list, learning_rate)
 
-    if denom < 1e-15:
-        probs = [1 / len(tmp_scores)] * len(tmp_scores)
-    else:
-        probs = [x / denom for x in tmp_scores]
 
-    rand_num = np.random.rand()
-    cum = 0.0
-    for idx, p in enumerate(probs):
-        cum += p
-        if rand_num <= cum:
-            return candidate_paths[idx], probs
-    return candidate_paths[-1], probs
+def k_shortest_paths(adj_list, source, target, K=3, cost_fun=None):
+    """
+    K-shortest-paths (based on a Dijkstra-like BFS + heapq).
+    cost_fun(o, d) gives the cost of edge (o->d); by default, uses free_flow_time.
+    """
+    if source not in adj_list or target not in adj_list:
+        return []
+    if cost_fun is None:
+        def cost_fun(o_, d_):
+            return adj_list[o_][d_]['free_flow_time']
 
-#########################################
-# 7. get_shortestpath_
-#########################################
-def get_shortestpath_with_spao(inode, tnode_list, network, index_table,
-                               current_time, iteration,
-                               psi0=1.0, eta=0.5, lambda_=1.0, xi=1.0, c=1.0,
-                               event=False,
-                               use_loglinear=False,
-                               user_flow=1.0):
-    if not use_loglinear:
-        # Dijkstra式搜索, cost来自 calculate_edge_cost
-        S = []
-        nodes = set(network['init_node']).union(set(network['term_node']))
-        S_non = list(nodes)
-        M = float('inf')
-        dist = dict.fromkeys(S_non, M)
-        pred = dict.fromkeys(S_non, None)
-        dist[inode] = 0
-
-        while S_non:
-            min_node = min(S_non, key=lambda node: dist[node])
-            if dist[min_node] == M:
-                break
-            S_non.remove(min_node)
-            S.append(min_node)
-            if set(tnode_list).issubset(set(S)):
-                break
-            edges_from_min_node = network[network['init_node'] == min_node]
-            for idx_2, row in edges_from_min_node.iterrows():
-                node = row['term_node']
-                if node not in S_non:
+    heap = [(0, [source])]
+    paths = []
+    visited_set = set()
+    while heap and len(paths) < K:
+        cur_cost, path = heapq.heappop(heap)
+        last_node = path[-1]
+        if last_node == target:
+            paths.append((cur_cost, path))
+            continue
+        if last_node in adj_list:
+            for nxt in adj_list[last_node]:
+                # Avoid loops
+                if nxt in path:
                     continue
-                cost_edge = calculate_edge_cost(
-                    min_node, node, network, current_time, iteration,
-                    psi0=psi0, eta=eta, lambda_=lambda_, xi=xi, c=c,
-                    event=event,
-                    user_flow=user_flow
-                )
-                if dist[min_node] + cost_edge < dist[node]:
-                    dist[node] = dist[min_node] + cost_edge
-                    pred[node] = min_node
+                edge_cost = cost_fun(last_node, nxt)
+                new_path = path + [nxt]
+                new_cost = cur_cost + edge_cost
+                if (last_node, nxt, len(path)) in visited_set:
+                    continue
+                visited_set.add((last_node, nxt, len(path)))
+                heapq.heappush(heap, (new_cost, new_path))
+    return [p[1] for p in paths]
 
-        result = []
-        for tnode in tnode_list:
-            if dist[tnode] == M:
-                result.append([inode, tnode, None, M])
-                continue
-            path = []
-            current_node = tnode
-            while current_node != inode:
-                path.append(current_node)
-                current_node = pred[current_node]
-                if current_node is None:
-                    break
-            if current_node is None:
-                result.append([inode, tnode, None, M])
-                continue
-            path.append(inode)
-            path.reverse()
-            result.append([inode, tnode, path, dist[tnode]])
-        return result
 
-    else:
-        # 用最短路 + log-linear 挑选
-        result = []
-        for tnode in tnode_list:
-            sp_result = get_shortestpath_with_spao(
-                inode, [tnode], network, index_table, current_time, iteration,
-                psi0, eta, lambda_, xi, c, event, use_loglinear=False,
-                user_flow=user_flow
-            )
-            if sp_result and sp_result[0][2] is not None:
-                candidate_paths = [sp_result[0][2]]  # 这里仅取最短路为候选
-                chosen_path, _probs = log_linear_path_choice(
-                    candidate_paths, iteration, network, current_time,
-                    psi0, eta, lambda_, xi, c, event, kappa=1.0, user_flow=user_flow
-                )
-                cost_val = 0.0
-                for i in range(len(chosen_path) - 1):
-                    cost_val += calculate_edge_cost(
-                        chosen_path[i], chosen_path[i + 1],
-                        network, current_time, iteration,
-                        psi0, eta, lambda_, xi, c, event,
-                        user_flow=user_flow
-                    )
-                result.append([inode, tnode, chosen_path, cost_val])
-            else:
-                result.append([inode, tnode, None, float('inf')])
-        return result
+########################################################################
+# 4. Dynamic cost calculation (integrating time-varying parameters)
+########################################################################
+def calculate_edge_cost(o, d, t, iteration, adj_list,
+                        tv_params, event=False, user_flow=1.0,
+                        alpha=0.15, beta=4.0):
+    """
+    At time period t, iteration 'iteration', calculate the comprehensive cost of edge (o->d):
+      cost = base_time + external_cost
+      base_time = ltm_time * [1 + gamma_t / (1 + psi_t)]
+    """
+    data = adj_list[o][d]
+    fft = data['free_flow_time']
+    capacity = data['capacity']
 
-#########################################
-# 8.LTM排队传播
-#########################################
+    flow_arr = data['flow']
+    flow_ti = flow_arr[t] if t < len(flow_arr) else 0.0
+
+    flow_time_arr = data['flow_time']
+    ltm_time = flow_time_arr[t] if t < len(flow_time_arr) else fft
+    if ltm_time <= 0:
+        ltm_time = fft
+
+    # Time-varying gamma, psi
+    gamma_val = tv_params.get_gamma(iteration)
+    psi_val = tv_params.get_psi(flow_ti, capacity)
+
+    dyn_factor = 1.0 + gamma_val / (1.0 + psi_val)
+    base_time = ltm_time * dyn_factor
+
+    # External cost
+    ext_cost = external_cost_for_edge(o, d, t, flow_ti, capacity, fft,
+                                      user_flow=user_flow, alpha=alpha, beta=beta)
+    total_cost = base_time + ext_cost
+
+    # If event occurs, multiply by 1.2
+    if event:
+        total_cost *= 1.2
+
+    return total_cost
+
+
+def calculate_path_cost(path_nodes, adj_list, iteration,
+                        tv_params, total_time, event=False, user_flow=1.0,
+                        alpha=0.15, beta=4.0):
+    """
+    Calculate the cost of a path over time periods 0..(total_time-1).
+    Example here: take the average of costs across all time periods.
+    """
+    if len(path_nodes) < 2:
+        return 999999.0
+    if total_time <= 0:
+        return 999999.0
+
+    sum_cost = 0.0
+    for t in range(total_time):
+        c_t = 0.0
+        for i in range(len(path_nodes) - 1):
+            o = path_nodes[i]
+            d = path_nodes[i + 1]
+            c_edge = calculate_edge_cost(o, d, t, iteration,
+                                         adj_list,
+                                         tv_params=tv_params,
+                                         event=event,
+                                         user_flow=user_flow,
+                                         alpha=alpha,
+                                         beta=beta)
+            c_t += c_edge
+        sum_cost += c_t
+    avg_cost = sum_cost / total_time
+    return avg_cost
+
+
+########################################################################
+# 5. MinimalLTM: A simplified queue propagation model
+########################################################################
 class MinimalLTM:
-    def __init__(self, network_df, total_time):
-        self.network_df = network_df
+    """
+    A simplified LTM model using discrete time steps (Q_in / Q_out) to simulate flow propagation.
+    """
+
+    def __init__(self, adj_list, total_time):
+        self.adj_list = adj_list
         self.total_time = total_time
         self.G = nx.DiGraph()
         self._build_graph()
+
         self.time_interval = 1.0
         self.total_travel_time_records = []
 
     def _build_graph(self):
-        for idx, row in self.network_df.iterrows():
-            o = row["init_node"]
-            d = row["term_node"]
-            cap = row["capacity"]
-            fft = row["free_flow_time"]
-            lng = row.get("length", 1.0)
-            self.G.add_node(o)
-            self.G.add_node(d)
-            self.G.add_edge(o, d, capacity=cap, free_flow_time=fft, length=lng)
+        """
+        Load the information from adj_list into a networkx.DiGraph
+        and initialize discrete flow arrays.
+        """
+        for o in self.adj_list:
+            for d, data in self.adj_list[o].items():
+                self.G.add_node(o)
+                self.G.add_node(d)
+                self.G.add_edge(o, d,
+                                capacity=data['capacity'],
+                                free_flow_time=data['free_flow_time'],
+                                length=data.get('length', 1.0))
 
         for (u, v) in self.G.edges:
             e = self.G[u][v]
@@ -300,23 +360,26 @@ class MinimalLTM:
             e["Q_in"] = np.zeros(self.total_time + 1)
             e["Q_out"] = np.zeros(self.total_time + 1)
             e["queue"] = []
-            e["buffer"] = []
 
             cap = e["capacity"]
             fft = e["free_flow_time"]
             lng = e["length"]
             f_speed = lng / fft if fft > 0 else 1.0
-            jam_density = 0.2
+            jam_density = 0.2  # simplified assumption
             c_dens = cap / f_speed if f_speed > 0 else cap
             if (jam_density - c_dens) > 1e-5:
                 b_speed = cap / (jam_density - c_dens)
             else:
                 b_speed = f_speed
+
             e["forward_speed"] = f_speed
             e["backward_speed"] = b_speed
             e["critical_density"] = c_dens
 
     def load_vehicles(self, od_assignments, t):
+        """
+        At time t, place the assigned (flow_val, path_nodes) vehicles into the first edge's queue.
+        """
         for (flow_val, path_nodes) in od_assignments:
             if len(path_nodes) < 2:
                 continue
@@ -338,6 +401,9 @@ class MinimalLTM:
                 e["N_down"][t] += e["N_down"][t - 1]
 
     def update(self, t):
+        """
+        Process queues on each edge with capacity constraints.
+        """
         for (u, v) in self.G.edges:
             e = self.G[u][v]
             supply = e["capacity"]
@@ -345,14 +411,18 @@ class MinimalLTM:
             while e["queue"]:
                 agent = e["queue"][0]
                 if agent["unit"] <= supply:
+                    # Enough capacity to let these vehicles pass
                     supply -= agent["unit"]
                     e["queue"].pop(0)
                     e["Q_out"][t] += agent["unit"]
                     e["N_down"][t + 1] += agent["unit"]
+
                     route_nodes = agent["route_nodes"]
                     idx = agent["cur_index"]
                     if idx + 2 < len(route_nodes):
-                        nxt_e = self.G[route_nodes[idx + 1]][route_nodes[idx + 2]]
+                        nxt_u = route_nodes[idx + 1]
+                        nxt_v = route_nodes[idx + 2]
+                        nxt_e = self.G[nxt_u][nxt_v]
                         nxt_e["queue"].append({
                             "unit": agent["unit"],
                             "start_time": agent["start_time"],
@@ -362,18 +432,23 @@ class MinimalLTM:
                         nxt_e["Q_in"][t] += agent["unit"]
                         nxt_e["N_up"][t + 1] += agent["unit"]
                     else:
+                        # Reached destination
                         trip_t = (t - agent["start_time"]) * self.time_interval
                         self.total_travel_time_records.append([trip_t, agent["unit"]])
                 else:
+                    # Only part of the vehicles can pass
                     partial = supply
                     agent["unit"] -= partial
                     supply = 0
                     e["Q_out"][t] += partial
                     e["N_down"][t + 1] += partial
+
                     route_nodes = agent["route_nodes"]
                     idx = agent["cur_index"]
                     if idx + 2 < len(route_nodes):
-                        nxt_e = self.G[route_nodes[idx + 1]][route_nodes[idx + 2]]
+                        nxt_u = route_nodes[idx + 1]
+                        nxt_v = route_nodes[idx + 2]
+                        nxt_e = self.G[nxt_u][nxt_v]
                         nxt_e["queue"].append({
                             "unit": partial,
                             "start_time": agent["start_time"],
@@ -390,13 +465,15 @@ class MinimalLTM:
             e["queue"] = new_queue
 
     def pro_update(self):
-        for (u, v) in self.G.edges:
-            e = self.G[u][v]
-            if e["buffer"]:
-                e["queue"].extend(e["buffer"])
-                e["buffer"] = []
+        """
+        Optional: for more complex post-update operations, if needed.
+        """
+        pass
 
     def run_simulation(self, od_assignments_by_t):
+        """
+        Main entry point: clear travel_time_records, then run updates and load vehicles by time step.
+        """
         self.total_travel_time_records.clear()
         for t in range(self.total_time):
             self.pre_update(t)
@@ -407,6 +484,9 @@ class MinimalLTM:
         return self._export_travel_time()
 
     def _export_travel_time(self):
+        """
+        Export the travel time of each edge per time period, based on density and wave speed.
+        """
         results = {}
         for (u, v) in self.G.edges:
             e = self.G[u][v]
@@ -415,7 +495,7 @@ class MinimalLTM:
             nd = e["N_down"]
             fsp = e["forward_speed"]
             bsp = e["backward_speed"]
-            cd  = e["critical_density"]
+            cd = e["critical_density"]
 
             arr_tt = np.zeros(self.total_time)
             for t in range(self.total_time):
@@ -426,191 +506,203 @@ class MinimalLTM:
         return results
 
     def get_total_trip_times(self):
+        """
+        Compute the average travel time of all vehicles that have reached their destination.
+        """
         if len(self.total_travel_time_records) == 0:
             return 0.0
         arr = np.array(self.total_travel_time_records)
-        wtt = np.sum(arr[:, 0] * arr[:, 1])
+        wtt = np.sum(arr[:, 0] * arr[:, 1])  # weighted total travel time
         total_flow = np.sum(arr[:, 1])
         return wtt / total_flow if total_flow > 1e-9 else 0.0
 
     def export_flows(self):
+        """
+        Export the flow on each edge (Q_in) per time period.
+        """
         flows = {}
         for (u, v) in self.G.edges:
             e = self.G[u][v]
             flows[(u, v)] = e["Q_in"][:self.total_time].copy()
         return flows
 
-#########################################
-# 9. 用LTM + 路径选择 来迭代求解
-#########################################
-def solve_nash_equilibrium_with_spao_LTM(network, od, start_term_rel, index_table,
-                                         total_time, max_iterations=10000,
-                                         event=False,
-                                         use_loglinear=False,
-                                         psi0=1.0, eta=0.5, lambda_=1.0, xi=1.0, c=1.0,
-                                         user_flow=1.0):
-    convergence_info = []
+
+########################################################################
+# 6. Main DTA solver (time-varying parameters + performance optimization)
+########################################################################
+def solve_multi_agent_dta_timevarying(adj_list, df_od,
+                                      total_time=5, max_iterations=10, K_paths=3,
+                                      event=False, user_flow=1.0,
+                                      tv_params=None,  # an instance of TimeVaryingParams
+                                      alpha=0.15, beta=4.0,
+                                      collect_convergence=True):
+    """
+    Main function for multi-agent DTA with time-varying parameters:
+      - In each iteration, assign paths to OD pairs based on the policy,
+        then run the MinimalLTM simulation to get travel time and flow by edge/time period.
+      - Then compute the average path cost and update the policies with a time-varying learning rate.
+    """
+    if tv_params is None:
+        # Use default fixed values if none provided
+        tv_params = TimeVaryingParams()
+
+    # Initialize flow and flow_time
+    for o in adj_list:
+        for d in adj_list[o]:
+            fft = adj_list[o][d]['free_flow_time']
+            adj_list[o][d]['flow'] = np.zeros(total_time)
+            adj_list[o][d]['flow_time'] = np.full(total_time, fft)
+
+    route_choice_manager = MultiAgentRouteChoice(adj_list, df_od, K_paths=K_paths)
+
+    if collect_convergence:
+        convergence_info = []
+    else:
+        convergence_info = None
+
     prev_avg_tt = None
 
-    # 初始化：先将 network["flow_time"] = free_flow_time
-    for i in range(len(network)):
-        fft = network.at[i, "free_flow_time"]
-        network.at[i, "flow_time"] = np.full(total_time, fft)
-
+    # -- Begin iterations
     for iteration in range(1, max_iterations + 1):
-        print(f"\n=== Iteration: {iteration} ===")
-        iter_start_time = time.time()
+        # Clear external cost cache to avoid leftover from previous iteration
+        _external_cost_cache.clear()
 
-        # (A) 构建每时段的 OD -> path -> flow
+        # A) Assign flows by policy (for each time period)
         od_assignments_by_t = {}
         for t in range(total_time):
-            all_shortest_path = []
-            for item in start_term_rel:
-                result = get_shortestpath_with_spao(
-                    inode=item["start_node"],
-                    tnode_list=item["term_node_list"],
-                    network=network,
-                    index_table=index_table,
-                    current_time=t,
-                    iteration=iteration,
-                    psi0=psi0, eta=eta, lambda_=lambda_, xi=xi, c=c,
-                    event=event,
-                    use_loglinear=use_loglinear,
-                    user_flow=user_flow
-                )
-                all_shortest_path += result
+            assignments_for_t = route_choice_manager.choose_paths_for_all_agents(iteration, t)
+            if assignments_for_t:
+                od_assignments_by_t[t] = assignments_for_t
 
-            # 转为 (flow, path_nodes) 格式; 简单假设每时段都出发 od["demand"]
-            shortest_path_dict = {(p[0], p[1]): p for p in all_shortest_path}
-            od_assign_list = []
-            for i2 in range(len(od)):
-                st = od.iloc[i2]["init_node"]
-                ed = od.iloc[i2]["term_node"]
-                dm = od.iloc[i2]["demand"]
-                if (st, ed) in shortest_path_dict:
-                    path_info = shortest_path_dict[(st, ed)]
-                    chosen_path = path_info[2]
-                    if chosen_path is not None:
-                        od_assign_list.append((dm, chosen_path))
-            if od_assign_list:
-                od_assignments_by_t[t] = od_assign_list
-
-        # (B) 运行 LTM
-        ltm_runner = MinimalLTM(network, total_time)
+        # B) LTM simulation
+        ltm_runner = MinimalLTM(adj_list, total_time)
         td_times = ltm_runner.run_simulation(od_assignments_by_t)
         avg_tt = ltm_runner.get_total_trip_times()
 
-        # (C) 更新 network["flow"], network["flow_time"]
+        # C) Update adj_list flow and flow_time
         link_flows = ltm_runner.export_flows()
-        for i_net in range(len(network)):
-            o_ = network.at[i_net, "init_node"]
-            d_ = network.at[i_net, "term_node"]
-            if (o_, d_) in link_flows:
-                arr_flow = link_flows[(o_, d_)]
-                network.at[i_net, "flow"] = arr_flow
+        for (o, d) in link_flows:
+            adj_list[o][d]['flow'] = link_flows[(o, d)]
+        for (o, d) in td_times:
+            adj_list[o][d]['flow_time'] = td_times[(o, d)]
 
-        for i_net in range(len(network)):
-            o_ = network.at[i_net, "init_node"]
-            d_ = network.at[i_net, "term_node"]
-            if (o_, d_) in td_times:
-                arr_tt = td_times[(o_, d_)]
-                network.at[i_net, "flow_time"] = arr_tt
+        # D) Calculate path costs and update policies
+        path_costs_for_agents = {}
+        for key, policy in route_choice_manager.agent_policies.items():
+            costs_list = []
+            for path_nodes in policy.paths:
+                cost_val = calculate_path_cost(path_nodes, adj_list,
+                                               iteration=iteration,
+                                               tv_params=tv_params,
+                                               total_time=total_time,
+                                               event=event,
+                                               user_flow=user_flow,
+                                               alpha=alpha,
+                                               beta=beta)
+                costs_list.append(cost_val)
+            path_costs_for_agents[key] = costs_list
 
-        # (D) GAP 或其他收敛指标
-        if prev_avg_tt is not None:
-            gap_val = abs(avg_tt - prev_avg_tt) / max(prev_avg_tt, 1e-9)
-        else:
-            gap_val = None
-        prev_avg_tt = avg_tt
+        # Use time-varying learning rate (example: depends on iteration, t=0)
+        lr_current = tv_params.get_learning_rate(iteration, 0)
+        route_choice_manager.update_all_policies(path_costs_for_agents, learning_rate=lr_current)
 
-        iter_end_time = time.time()
-        elapsed_time = iter_end_time - iter_start_time
-        print(f"  Iteration {iteration} => AvgTT={avg_tt:.4f}, GAP={gap_val}, Time={elapsed_time:.2f}s")
+        # E) Convergence info
+        if collect_convergence:
+            if prev_avg_tt is not None:
+                gap_val = abs(avg_tt - prev_avg_tt) / max(prev_avg_tt, 1e-9)
+            else:
+                gap_val = None
+            prev_avg_tt = avg_tt
+            print(f"Iteration={iteration}, AvgTT={avg_tt:.4f}, GAP={gap_val}")
+            convergence_info.append({"Iteration": iteration,
+                                     "AvgTT": avg_tt,
+                                     "GAP": gap_val})
 
-        convergence_info.append({
-            "Iteration": iteration,
-            "AvgTT": avg_tt,
-            "GAP": gap_val,
-            "Time_s": elapsed_time
-        })
+    # Collect final flows at the last time period
+    final_flow_output = []
+    for o in adj_list:
+        for d in adj_list[o]:
+            flow_arr = adj_list[o][d]['flow']
+            flow_last = flow_arr[-1] if len(flow_arr) > 0 else 0.0
+            final_flow_output.append([o, d, flow_last])
 
-    # 导出各边最终流量
-    final_flows = []
-    for (u, v) in ltm_runner.G.edges:
-        e = ltm_runner.G[u][v]
-        total_f = e["Q_out"].sum()
-        final_flows.append({
-            "Edge": f"{u}->{v}",
-            "From": u,
-            "To": v,
-            "TotalFlow": total_f
-        })
+    if convergence_info is not None:
+        conv_df = pd.DataFrame(convergence_info)
+    else:
+        conv_df = None
 
-    return convergence_info, final_flows
+    df_last_time = pd.DataFrame(final_flow_output, columns=["Init Node", "Term Node", "Flow_TLast"])
+    return conv_df, df_last_time
 
-#########################################
-# 10. 主函数示例
-#########################################
-if __name__ == '__main__':
-    # (1) 读取网络、OD、节点数据
+
+########################################################################
+# 7. Main function example
+########################################################################
+def main():
     network_path = 'network1.xlsx'
     od_path = 'od_data1.xlsx'
-    node_path = 'Node_Data.csv'
 
-    network_1 = read_data(network_path)
-    od_1 = read_data(od_path)
-    if os.path.exists(node_path):
-        node_data = read_node_data(node_path)
-        network_1 = pd.merge(network_1, node_data, left_on='init_node', right_on='Node', how='left')
-        network_1 = pd.merge(network_1, node_data, left_on='term_node', right_on='Node',
-                             suffixes=('_init', '_term'), how='left')
+    if not os.path.exists(network_path) or not os.path.exists(od_path):
+        print("Please ensure network1.xlsx and od_data1.xlsx exist in the current directory.")
+        return
 
-    # (2) 基本预处理
-    network_1['init_node'] = network_1['init_node'].astype(int)
-    network_1['term_node'] = network_1['term_node'].astype(int)
-    od_1 = od_1.dropna(subset=['init_node', 'term_node'])
-    od_1['init_node'] = od_1['init_node'].astype(int)
-    od_1['term_node'] = od_1['term_node'].astype(int)
-    od_1['demand'] = pd.to_numeric(od_1['demand'], errors='coerce').fillna(0)
-    od_1_new = od_1[od_1["demand"] > 0].copy().reset_index(drop=True)
+    # 1) Read data
+    df_network = pd.read_excel(network_path)
+    df_od = pd.read_excel(od_path)
 
-    network_1['capacity'] = network_1['capacity'].astype(float)
-    network_1['free_flow_time'] = network_1['free_flow_time'].astype(float)
-    if 'length' not in network_1.columns:
-        network_1['length'] = 1.0
+    # Field compatibility
+    if 'Source' in df_network.columns and 'Target' in df_network.columns:
+        df_network.rename(columns={'Source': 'init_node', 'Target': 'term_node'}, inplace=True)
+    if 'Source' in df_od.columns and 'Target' in df_od.columns:
+        df_od.rename(columns={'Source': 'init_node', 'Target': 'term_node'}, inplace=True)
 
-    # (3) 初始化
-    total_time = 5
-    add_three_col(network_1, od_1_new, total_time)
-    index_table_network = construct_index_table(network_1)
+    df_network['capacity'] = pd.to_numeric(df_network['capacity'], errors='coerce').fillna(0)
+    df_network['free_flow_time'] = pd.to_numeric(df_network['free_flow_time'], errors='coerce').fillna(0)
+    if 'length' not in df_network.columns:
+        df_network['length'] = 1.0
 
-    start_term_rel = []
-    for st in od_1_new['init_node'].unique():
-        tlist = od_1_new[od_1_new['init_node'] == st]['term_node'].unique().tolist()
-        start_term_rel.append({"start_node": st, "term_node_list": tlist})
+    df_od['demand'] = pd.to_numeric(df_od['demand'], errors='coerce').fillna(0)
+    df_od = df_od[df_od['demand'] > 0].copy()
 
-    # (4) 迭代
-    max_iterations = 10
-    (conv_info, final_flow_list) = solve_nash_equilibrium_with_spao_LTM(
-        network=network_1.copy(deep=True),
-        od=od_1_new.copy(deep=True),
-        start_term_rel=start_term_rel,
-        index_table=index_table_network,
-        total_time=total_time,
-        max_iterations=max_iterations,
-        event=True,
-        use_loglinear=True,
-        psi0=1.0, eta=0.5,
-        lambda_=1.0, xi=1.0, c=1.0,
-        user_flow=1.0  # 用于外部成本计算的一单位流量
+    # 2) Build adjacency list
+    adj_list = read_data_to_adjlist(df_network)
+
+    # 3) Define time-varying parameters (you can adjust them as needed)
+    tvp = TimeVaryingParams(
+        psi0=1.0,
+        eta=0.5,
+        lambda_=1.0,
+        xi=1.0,
+        c_=1.0,
+        base_lr=2.0  # a bit larger initial learning rate
     )
 
-    conv_df = pd.DataFrame(conv_info)
-    final_flow_df = pd.DataFrame(final_flow_list)
-    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_excel = f"traffic_assignment_results_LTM_{timestamp_str}.xlsx"
-    with pd.ExcelWriter(output_excel) as writer:
-        conv_df.to_excel(writer, sheet_name="Convergence_Info", index=False)
-        final_flow_df.to_excel(writer, sheet_name="Final_Flows", index=False)
+    # 4) Run the multi-agent DTA
+    t_start = time.time()
+    conv_df, last_time_df = solve_multi_agent_dta_timevarying(
+        adj_list, df_od,
+        total_time=5,
+        max_iterations=100,
+        K_paths=3,
+        event=True,
+        user_flow=1.0,
+        tv_params=tvp,
+        alpha=0.15,  # BPR parameter
+        beta=4.0,    # BPR parameter
+        collect_convergence=True
+    )
+    t_end = time.time()
+    print(f"\nExecution finished, time elapsed: {(t_end - t_start):.2f} seconds")
 
-    print(f"\nDone. Convergence & flow results => {output_excel}")
+    # 5) Write results to Excel
+    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_file = f"multi_agent_dta_timevarying_{timestamp_str}.xlsx"
+    with pd.ExcelWriter(out_file) as writer:
+        if conv_df is not None:
+            conv_df.to_excel(writer, sheet_name="Convergence_Info", index=False)
+        last_time_df.to_excel(writer, sheet_name="LastTime_Flow", index=False)
+    print(f"Convergence info & last-time flow have been written to -> {out_file}")
+
+
+if __name__ == '__main__':
+    main()
