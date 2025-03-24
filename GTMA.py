@@ -11,7 +11,7 @@ import copy
 
 
 ########################################################################
-# 0. Unified management of time-varying parameters
+# 0. Time-varying parameters
 ########################################################################
 class TimeVaryingParams:
     """
@@ -64,7 +64,7 @@ class TimeVaryingParams:
 
 
 ########################################################################
-# 1. Read data and build adjacency list
+# 1. Read data and build an adjacency list
 ########################################################################
 def read_data_to_adjlist(df_network):
     """
@@ -323,7 +323,7 @@ def calculate_path_cost(path_nodes, adj_list, iteration,
 
 
 ########################################################################
-# 5. MinimalLTM: A simplified queue propagation model
+# 5. MinimalLTM: A queue propagation model
 ########################################################################
 class MinimalLTM:
     """
@@ -636,7 +636,7 @@ def solve_multi_agent_dta_timevarying(adj_list, df_od,
 
 
 ########################################################################
-# 7. Main function example
+# 7. Main function
 ########################################################################
 def main():
     network_path = 'network1.xlsx'
